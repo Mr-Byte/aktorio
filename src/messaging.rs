@@ -1,9 +1,7 @@
 use super::Receiver;
 use super::ActorRef;
 
-use futures::{Future, Sink, Stream};
-
-use std::error::Error;
+use futures::{Future, Stream};
 
 pub trait FutureSender<T: Receiver> {
     fn pipe_to(self, actor_ref: &ActorRef<T>);
@@ -12,21 +10,10 @@ pub trait FutureSender<T: Receiver> {
 impl<F, A> FutureSender<A> for F
 where
     A: Receiver + 'static,
-    F: Future<Item = A::Message, Error = Box<Error>> + 'static,
+    F: Future<Item = A::Message> + Send + 'static,
 {
     fn pipe_to(self, actor_ref: &ActorRef<A>) {
-        if let Some(cell) = actor_ref.cell.upgrade() {
-            let future = {
-                let sender = cell.sender.clone();
-                self.and_then(|message| {
-                    sender
-                        .send(message)
-                        .map_err(|err| Box::new(err) as Box<Error>)
-                }).map(|_| ())
-            };
-
-            cell.pending_futures.borrow_mut().push(Box::new(future));
-        }
+        actor_ref.pipe_future(self);
     }
 }
 
@@ -37,16 +24,9 @@ pub trait StreamSender<T: Receiver> {
 impl<S, A> StreamSender<A> for S
 where
     A: Receiver + 'static,
-    S: Stream<Item = A::Message, Error = Box<Error>> + 'static,
+    S: Stream<Item = A::Message> + Send + 'static,
 {
     fn pipe_to(self, actor_ref: &ActorRef<A>) {
-        if let Some(cell) = actor_ref.cell.upgrade() {
-            let future = {
-                let sender = cell.sender.clone();
-                self.forward(sender).map(|_| ())
-            };
-
-            cell.pending_futures.borrow_mut().push(Box::new(future));
-        }
+        actor_ref.pipe_stream(self);
     }
 }

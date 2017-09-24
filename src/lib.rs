@@ -1,22 +1,29 @@
 #[macro_use]
 extern crate downcast_rs;
 extern crate futures;
+extern crate tokio_core;
 
 pub mod system;
 pub mod reference;
 pub mod messaging;
-mod cell;
 
-pub use self::system::{ActorContextRef, ActorSystem};
+pub use self::system::ActorSystem;
 pub use self::reference::ActorRef;
 pub use self::messaging::{FutureSender, StreamSender};
 
-pub trait Receiver {
-    type Message;
-    type Error;
+pub trait Receiver
+where
+    Self: Send,
+{
+    type Message: Send;
+    type Error: Send;
 
-    fn initialize(&mut self, _context: ActorContextRef, _self_ref: ActorRef<Self>)
-    where
+    fn initialize(
+        &mut self,
+        _actor_system: ActorSystem,
+        _self_ref: ActorRef<Self>,
+        _handle: ::tokio_core::reactor::Handle,
+    ) where
         Self: Sized,
     {
     }
@@ -25,12 +32,14 @@ pub trait Receiver {
 }
 
 pub trait ErrorReceiver<T> {
-    fn receive_error(&mut self, error: T, actor_id: &str);
+    fn receive_error(&mut self, error: T);
 }
 
 impl<T> Receiver for T
 where
-    T: ::futures::Sink,
+    T: ::futures::Sink + Send,
+    T::SinkItem: Send,
+    T::SinkError: Send,
 {
     type Message = <Self as ::futures::Sink>::SinkItem;
     type Error = <Self as ::futures::Sink>::SinkError;

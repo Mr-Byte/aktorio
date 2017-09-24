@@ -3,6 +3,16 @@ name = "aktorio"
 version = "0.1.0"
 authors = ["Joshua Rodgers <bytemr@gmail.com>"]
 
+[lib]
+name = "aktorio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
+doc = false
+
 [dependencies]
 futures = "0.1"
+tokio-core = "0.1"
 downcast-rs = "^1"
