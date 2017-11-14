@@ -1,45 +1,84 @@
-use super::{ErrorReceiver, Receiver};
-use super::reference::{ActorCell, ActorCellRef, ActorRef};
+use {ErrorReceiver, Receiver};
+use reference::ActorRef;
+use context::{ActorContext, ActorContextRef, ActorFuture};
+use Context;
 
-use tokio_core::reactor::Core;
+use tokio_core::reactor::{Core, Handle};
 
 use std::collections::HashMap;
 use std::thread;
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::sync::{Arc, RwLock, Weak};
 
-#[derive(Clone)]
+thread_local! {
+    static CORE: RefCell<Core> = RefCell::new(Core::new().expect("Unable to create core for thread."));
+    pub(crate) static HANDLE: Handle = CORE.with(|core| core.borrow().handle());
+}
+
+pub struct ActorSystemContext {
+    actors: HashMap<String, Box<ActorContextRef>>,
+}
+
+impl ActorSystemContext {
+    fn new() -> ActorSystemContext {
+        ActorSystemContext { actors: HashMap::new() }
+    }
+
+    #[inline]
+    pub fn find_actor_ref<T>(&self, id: &str) -> Option<ActorRef<T>>
+    where
+        T: Receiver + Send + 'static,
+    {
+        self.find_actor_context(id).map(
+            |context| context.actor_ref(),
+        )
+    }
+
+    #[inline]
+    fn find_actor_context<R>(&self, id: &str) -> Option<Arc<ActorContext<R>>>
+    where
+        R: Receiver + 'static,
+    {
+        self.actors.get(id).and_then(|context_ref| {
+            context_ref.downcast_ref::<Arc<ActorContext<R>>>().map(
+                |context| context.clone(),
+            )
+        })
+    }
+}
+
 pub struct ActorSystem {
-    actors: Arc<Mutex<HashMap<String, Box<ActorCellRef>>>>,
+    context: Arc<RwLock<ActorSystemContext>>,
 }
 
 impl ActorSystem {
     pub fn new() -> ActorSystem {
-        ActorSystem {
-            actors: Arc::new(Mutex::new(HashMap::new())),
-        }
+        ActorSystem { context: Arc::new(RwLock::new(ActorSystemContext::new())) }
     }
 
-    pub fn new_actor<R>(&mut self, id: &str, actor: R) -> ActorBuilder<R>
+    pub fn new_actor<R>(&self, id: &str, actor: R) -> ActorBuilder<R>
     where
-        R: Receiver + Send + 'static,
+        R: Receiver + 'static,
     {
-        ActorBuilder::new(self.clone(), id.to_owned(), actor)
+        ActorBuilder::new(Arc::downgrade(&self.context), id.to_owned(), actor)
     }
 
-    pub fn find_actor_ref<T>(&mut self, id: &str) -> Option<ActorRef<T>>
+    pub fn find_actor_ref<T>(&self, id: &str) -> Option<ActorRef<T>>
     where
-        T: Receiver + 'static,
+        T: Receiver + Send + 'static,
     {
-        if let Ok(ref mut actors) = self.actors.lock() {
-            if let Some(actor_cell_ref) = actors.get(id) {
-                actor_cell_ref
-                    .downcast_ref::<Arc<ActorCell<T>>>()
-                    .map(|actor_cell| ActorRef::new(Arc::downgrade(actor_cell)))
-            } else {
-                None
+        self.context.read().ok().and_then(
+            |context| context.find_actor_ref(id),
+        )
+    }
+
+    pub fn run(&self) {
+        loop {
+            if let Ok(ref context) = self.context.read() {
+                if context.actors.len() == 0 {
+                    break;
+                }
             }
-        } else {
-            None
         }
     }
 }
@@ -50,7 +89,7 @@ impl Receiver for DropErrorReceiver {
     type Message = ();
     type Error = ();
 
-    fn receive(&mut self, _: Self::Message) -> Result<(), ()> {
+    fn receive(&mut self, _: Self::Message, _: &Context<Self>) -> Result<(), ()> {
         Ok(())
     }
 }
@@ -61,10 +100,10 @@ impl<T> ErrorReceiver<T> for DropErrorReceiver {
 
 pub struct ActorBuilder<T, E = DropErrorReceiver>
 where
-    T: Receiver + Send + 'static,
-    E: Receiver + ErrorReceiver<T::Error>  + Send + 'static,
+    T: Receiver + 'static,
+    E: Receiver + ErrorReceiver<T::Error> + 'static,
 {
-    actor_system: ActorSystem,
+    context: Weak<RwLock<ActorSystemContext>>,
     id: String,
     actor: T,
     error_receiver: Option<ActorRef<E>>,
@@ -72,12 +111,16 @@ where
 
 impl<T, E> ActorBuilder<T, E>
 where
-    T: Receiver + Send + 'static,
-    E: Receiver + ErrorReceiver<T::Error> + Send + 'static,
+    T: Receiver + 'static,
+    E: Receiver + ErrorReceiver<T::Error> + 'static,
 {
-    fn new(actor_system: ActorSystem, id: String, actor: T) -> ActorBuilder<T, E> {
+    pub(crate) fn new(
+        context: Weak<RwLock<ActorSystemContext>>,
+        id: String,
+        actor: T,
+    ) -> ActorBuilder<T, E> {
         ActorBuilder {
-            actor_system,
+            context,
             id,
             actor,
             error_receiver: None,
@@ -89,7 +132,7 @@ where
         R: Receiver + ErrorReceiver<T::Error> + 'static,
     {
         ActorBuilder {
-            actor_system: self.actor_system,
+            context: self.context,
             actor: self.actor,
             id: self.id,
             error_receiver: Some(error_receiver),
@@ -98,34 +141,51 @@ where
 
     pub fn spawn(self) -> ActorRef<T> {
         let (ref_sender, ref_receiver) = ::std::sync::mpsc::channel();
-        let actor_system = self.actor_system.clone();
+        let context = self.context.clone();
 
         thread::spawn(move || {
-            let mut core = Core::new().expect("Unable to create event loop for actor. WutFace");
-            let actor_cell = Arc::new(ActorCell::new(self.actor, core.remote()));
+            CORE.with(move |core| {
 
-            if let Ok(ref mut actors) = actor_system.actors.lock() {
-                actors.insert(self.id.clone(), Box::new(actor_cell.clone()));
-            }
+                let actor_context = Arc::new(ActorContext::new(&self.id, self.actor, context.clone()));
+                let actor_ref = actor_context.actor_ref().clone();
 
-            let mut actor_ref = ActorRef::new(Arc::downgrade(&actor_cell));
-            actor_ref.initialize(actor_system.clone(), core.handle());
+                if let Some(context) = context.upgrade() {
+                    if let Ok(ref mut context) = context.write() {
+                        context.actors.insert(self.id.clone(), Box::new(actor_context.clone()));
+                    }
 
-            ref_sender
-                .send(actor_ref.clone())
-                .expect("Failed to return ActorRef. WutFace");
+                    ref_sender.send(actor_ref).expect(
+                        "Failed to return ActorRef. WutFace",
+                    );
 
-            if let Err(error) = core.run(actor_ref) {
-                if let Some(ref mut error_receiver) = self.error_receiver.clone() {
-                    error_receiver.send_error(error);
+                    let actor_future = ActorFuture::new(actor_context.clone());
+
+                    if let Err(error) = core.borrow_mut().run(actor_future) {
+                        if let Some(error_receiver_ref) = self.error_receiver {
+                            if let Ok(id) = error_receiver_ref.id() {
+                                if let Ok(context) = context.read() {
+                                    if let Some(error_receiver) =
+                                        context.find_actor_context::<E>(&id)
+                                    {
+                                        error_receiver.send_error(error);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Turn the event loop one last time to poll any futures that may have been queued on the event loop, one last time.
+                    // I'm not really happy with this solution and may investigate a better way to handle this.  Without this, there were panics
+                    // when the actor in question errored out, but there were still respondable messages responses queued up.
+                    core.borrow_mut().turn(None);
+
+                    if let Ok(ref mut context) = context.write() {
+                        context.actors.remove(&self.id);
+                    };
                 }
-            }
-
-            if let Ok(ref mut actors) = actor_system.actors.lock() {
-                actors.remove(&self.id);
-            };
+            });
         });
- 
+
         ref_receiver.recv().expect("Unable to get remote.")
     }
 }

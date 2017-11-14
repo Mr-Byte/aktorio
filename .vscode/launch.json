@@ -8,7 +8,9 @@
             "program": "${workspaceRoot}/target/debug/main.exe",
             "args": [],
             "cwd": "${workspaceRoot}",
-            "env": { },
+            "env": {
+                "RUST_BACKTRACE": "1"
+            },
             "console": "internalConsole"
         }
     ]

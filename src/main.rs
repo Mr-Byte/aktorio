@@ -2,81 +2,40 @@ extern crate aktorio;
 extern crate futures;
 extern crate tokio_core;
 
-use aktorio::{ActorRef, ActorSystem, ErrorReceiver, Receiver, StreamSender};
-use futures::stream;
+use aktorio::{ActorSystem, Context, Receiver};
 
 pub fn main() {
-    let mut actor_system = ActorSystem::new();
-    let mut actor_ref = actor_system.new_actor("butts", TestActor::new()).spawn();
+    let actor_system = ActorSystem::new();
+    let first_actor = actor_system.new_actor("first", FirstActor).spawn();
+    first_actor.send_message("Hello, world!".to_owned());
 
-    let messages = stream::iter_ok::<_, ()>(vec![
-        "Hello, Mercury!".to_owned(),
-        "Hello, Venus!".to_owned(),
-        "Hello, Earth!".to_owned(),
-        "Hello, Mars!".to_owned(),
-        "Hello, Jupiter!".to_owned(),
-        "Hello, Saturn!".to_owned(),
-        "Hello, Uranus!".to_owned(),
-        "Hello, Neptune!".to_owned(),
-        "Hello, Pluto!".to_owned(),
-        "Hello, Oort Cloud!".to_owned(),
-    ]);
-
-    messages.pipe_to(&mut actor_ref);
-
-    ::std::thread::sleep(::std::time::Duration::from_secs(10));
+    actor_system.run();
 }
 
-struct TestActor {
-    other_actor: Option<ActorRef<OtherActor>>,
-}
+struct FirstActor;
 
-impl TestActor {
-    fn new() -> TestActor {
-        TestActor { other_actor: None }
-    }
-}
-
-impl Receiver for TestActor {
+impl Receiver for FirstActor {
     type Message = String;
-    type Error = ();
+    type Error = String;
 
-    fn initialize(
-        &mut self,
-        mut actor_system: ActorSystem,
-        self_ref: ActorRef<Self>,
-        _: ::tokio_core::reactor::Handle,
-    ) {
-        self.other_actor = Some(
-            actor_system
-                .new_actor("other", OtherActor)
-                .error_receiver(self_ref)
-                .spawn(),
-        );
-    }
+    fn receive(&mut self, message: String, context: &Context<Self>) -> Result<(), String> {
+        println!("FirstActor: {}", message);
 
-    fn receive(&mut self, message: Self::Message) -> Result<(), ()> {
-        println!("TestActor: {}", message);
-        self.other_actor.as_mut().unwrap().send_message(message);
+        let second_actor = context.new_actor("other", SecondActor).spawn();
+        second_actor.send_message(message.to_lowercase())?;
 
         Ok(())
     }
 }
 
-impl ErrorReceiver<String> for TestActor {
-    fn receive_error(&mut self, error: String) {
-        println!("Received error: {}", error);
-    }
-}
+struct SecondActor;
 
-struct OtherActor;
-
-impl Receiver for OtherActor {
+impl Receiver for SecondActor {
     type Message = String;
-    type Error = String;
+    type Error = ();
 
-    fn receive(&mut self, message: Self::Message) -> Result<(), String> {
-        println!("OtherActor: {}", message);
+    fn receive(&mut self, message: Self::Message, _: &Context<Self>) -> Result<(), ()> {
+        println!("SecondActor: {}", message);
 
         Ok(())
     }
